@@ -1,0 +1,24 @@
+services:
+  buoy-lake:
+    build: .
+    image: buoy-lake-compactor
+    container_name: buoy-lake
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      # seconds between retired-file reclamation sweeps
+      LAKE_GC_INTERVAL_SEC: "2"
+      # demo/test hook: artificial merge delay; keep 0 in production
+      LAKE_COMPACTION_DELAY_SEC: "0"
+    volumes:
+      - lake-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  lake-data:
