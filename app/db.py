@@ -1,6 +1,6 @@
 """SQLite metadata layer.
 
-Two tables:
+Three tables:
 
 * ``files``       -- registry of every parquet file that belongs to a daily
                      partition.  ``state`` is ``active`` (visible to readers)
@@ -11,10 +11,17 @@ Two tables:
                      guarantees at most one ``running`` job per day, which is
                      what lets us reject concurrent compactions for the same
                      day atomically (even across a process restart).
+* ``feed_rows``   -- append-only incremental feed for downstream consumers
+                     (transactional outbox): one row per uploaded
+                     observation, inserted in the SAME transaction that
+                     registers the upload's parquet file, so a batch is
+                     visible in the feed iff its file is registered.
 
 The compaction *switch* (retire inputs + register output + mark job done)
 happens in a single SQLite transaction, so a crash can never leave the
-registry half-switched.
+registry half-switched.  ``feed_rows`` is never touched by compaction or
+reclamation, so feed cursors (``seq`` high-water marks) keep their meaning
+across compactions, GC sweeps and restarts.
 """
 
 from __future__ import annotations
@@ -48,6 +55,22 @@ CREATE TABLE IF NOT EXISTS compactions (
 -- At most one running compaction per day (enforced by the DB itself).
 CREATE UNIQUE INDEX IF NOT EXISTS ux_compactions_one_running_per_day
     ON compactions(day) WHERE status = 'running';
+
+-- Append-only incremental feed (transactional outbox).  ``seq`` is the
+-- global ingestion (successful-registration) order and is what feed
+-- cursors refer to; AUTOINCREMENT guarantees it is never reused, so an
+-- issued cursor keeps its meaning across compactions, GC and restarts.
+-- Rows are never updated or deleted.  ``file_id`` is informational only:
+-- GC may delete the referenced ``files`` row, hence deliberately no FK.
+CREATE TABLE IF NOT EXISTS feed_rows (
+    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+    day      TEXT NOT NULL,
+    file_id  INTEGER NOT NULL,
+    buoy_id  TEXT NOT NULL,
+    ts_utc   TEXT NOT NULL,
+    salinity REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_feed_rows_day_seq ON feed_rows(day, seq);
 """
 
 

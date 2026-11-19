@@ -14,8 +14,10 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.db import connect  # noqa: E402
+from app.csvio import parse_csv  # noqa: E402
 from app.lake import Lake  # noqa: E402
 from app.main import create_app  # noqa: E402
+from app.storage import write_parquet_atomic  # noqa: E402
 
 DAY = "2026-11-18"
 
@@ -63,6 +65,32 @@ def wait_job(client: TestClient, day: str, job_id: int, timeout: float = 15.0) -
 
 def make_client(tmp_path, **kwargs) -> TestClient:
     return TestClient(create_app(data_dir=str(tmp_path / "data"), **kwargs))
+
+
+def increment(client: TestClient, day: str = DAY, cursor=None, limit=None) -> dict:
+    params = {}
+    if cursor is not None:
+        params["cursor"] = cursor
+    if limit is not None:
+        params["limit"] = limit
+    r = client.get(f"/days/{day}/increment", params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def drain_increment(client: TestClient, day: str = DAY, limit: int = 500):
+    """Follow cursors from the start of the feed to its current end."""
+    records: list[dict] = []
+    cursor = None
+    for _ in range(1000):  # safety net against a looping cursor
+        body = increment(client, day=day, cursor=cursor, limit=limit)
+        assert body["row_count"] == len(body["records"]) <= limit
+        records.extend(body["records"])
+        if not body["has_more"]:
+            return records, body
+        assert body["next_cursor"] is not None
+        cursor = body["next_cursor"]
+    raise AssertionError("increment feed did not terminate")
 
 
 # ---------------------------------------------------------------------------
@@ -391,3 +419,281 @@ def test_concurrent_reads_during_compaction_are_consistent(tmp_path):
         for t in threads:
             t.join()
         assert not errors, errors
+
+
+# ---------------------------------------------------------------------------
+# incremental feed (/days/{day}/increment)
+# ---------------------------------------------------------------------------
+
+def test_increment_returns_upload_order_and_duplicates(tmp_path):
+    with make_client(tmp_path) as c:
+        upload(c, CSV_A)
+        upload(c, CSV_DUP)
+        upload(c, CSV_DUP)  # same observation again -> delivered again
+        body = increment(c)
+        assert body["day"] == DAY
+        assert body["row_count"] == 6
+        assert body["has_more"] is False
+        keys = [(r["buoy_id"], r["ts_utc"], r["salinity"]) for r in body["records"]]
+        assert keys == [
+            ("B001", "2026-11-18T00:01:00Z", 35.1),
+            ("B002", "2026-11-18T00:02:00Z", 35.2),
+            ("B009", "2026-11-18T03:00:00Z", 33.3),
+            ("B009", "2026-11-18T03:00:00Z", 33.3),
+            ("B009", "2026-11-18T03:00:00Z", 33.3),
+            ("B009", "2026-11-18T03:00:00Z", 33.3),
+        ]
+        # exactly the raw three columns
+        assert all(set(r) == {"buoy_id", "ts_utc", "salinity"} for r in body["records"])
+
+
+def test_increment_pagination_never_loses_or_repeats_rows(tmp_path):
+    """Any page size -- including ones cutting through a batch -- is exact."""
+    expected = [
+        ("B001", "2026-11-18T00:01:00Z", 35.1),
+        ("B002", "2026-11-18T00:02:00Z", 35.2),
+        ("B001", "2026-11-18T01:01:00Z", 35.3),
+        ("B003", "2026-11-18T01:02:00Z", 34.9),
+        ("B004", "2026-11-18T02:00:00Z", 36.0),
+        ("B009", "2026-11-18T03:00:00Z", 33.3),
+        ("B009", "2026-11-18T03:00:00Z", 33.3),
+    ]
+    with make_client(tmp_path) as c:
+        upload(c, CSV_A)     # 2 rows
+        upload(c, CSV_B)     # 2 rows
+        upload(c, CSV_C)     # 1 row
+        upload(c, CSV_DUP)   # 2 identical rows
+        for limit in (1, 2, 3, 4, 5, 500):
+            records, _ = drain_increment(c, limit=limit)
+            keys = [(r["buoy_id"], r["ts_utc"], r["salinity"]) for r in records]
+            assert keys == expected, f"limit={limit}"
+
+
+def test_increment_stops_mid_batch_and_resumes(tmp_path):
+    """A page boundary inside one upload batch must not lose rows."""
+    with make_client(tmp_path) as c:
+        upload(c, CSV_A)  # rows 1-2
+        upload(c, CSV_B)  # rows 3-4
+        page1 = increment(c, limit=3)  # cuts through CSV_B's batch
+        assert [r["buoy_id"] for r in page1["records"]] == ["B001", "B002", "B001"]
+        assert page1["has_more"] is True
+        page2 = increment(c, cursor=page1["next_cursor"], limit=3)
+        assert [r["buoy_id"] for r in page2["records"]] == ["B003"]
+        assert page2["has_more"] is False
+
+
+def test_increment_page_size_capped_at_500(tmp_path):
+    big = "buoy_id,ts_utc,salinity\n" + "".join(
+        f"B{i % 9:02d},2026-11-18T06:{i // 60:02d}:{i % 60:02d}Z,3{i % 10}.{i % 9}\n"
+        for i in range(600)
+    )
+    with make_client(tmp_path) as c:
+        upload(c, big)
+        page1 = increment(c)  # default page size
+        assert page1["row_count"] == 500 and page1["has_more"] is True
+        page2 = increment(c, cursor=page1["next_cursor"], limit=9999)  # clamped
+        assert page2["row_count"] == 100 and page2["has_more"] is False
+        # pages tile the full feed exactly, no overlap
+        all_records, _ = drain_increment(c)
+        assert page1["records"] + page2["records"] == all_records
+
+
+def test_increment_follows_new_uploads(tmp_path):
+    """Rows uploaded after a page was served appear in later requests."""
+    with make_client(tmp_path) as c:
+        upload(c, CSV_A)
+        page = increment(c)
+        assert page["row_count"] == 2 and page["has_more"] is False
+        cursor = page["next_cursor"]
+
+        upload(c, CSV_B)
+        page = increment(c, cursor=cursor)
+        assert [r["buoy_id"] for r in page["records"]] == ["B001", "B003"]
+        cursor = page["next_cursor"]
+
+        upload(c, CSV_C)
+        page = increment(c, cursor=cursor)
+        assert [r["buoy_id"] for r in page["records"]] == ["B004"]
+        assert page["has_more"] is False
+
+
+def test_increment_empty_day_and_bad_params(tmp_path):
+    with make_client(tmp_path) as c:
+        body = increment(c)
+        assert body["records"] == [] and body["row_count"] == 0
+        assert body["next_cursor"] is None and body["has_more"] is False
+
+        upload(c, CSV_A)
+        for bad in ("abc", "-1", "1.5", "1e3", " "):
+            r = c.get(f"/days/{DAY}/increment", params={"cursor": bad})
+            assert r.status_code == 400, bad
+        assert c.get(f"/days/{DAY}/increment", params={"limit": 0}).status_code == 400
+        assert c.get(f"/days/{DAY}/increment", params={"limit": -3}).status_code == 400
+        assert c.get("/days/18-11-2026/increment").status_code == 400
+
+
+def test_increment_excludes_failed_uploads(tmp_path, monkeypatch):
+    import app.lake as lake_mod
+
+    with make_client(tmp_path) as c:
+        # CSV parse failure -> 422, nothing registered
+        r = c.post(f"/days/{DAY}/upload", content=b"buoy_id,ts_utc,salinity\nB1,nope,35\n",
+                   headers={"Content-Type": "text/csv"})
+        assert r.status_code == 422
+
+        # parquet write failure -> request fails, nothing registered
+        original = lake_mod.write_parquet_atomic
+        def boom(*args, **kwargs):
+            raise IOError("disk full (simulated)")
+        monkeypatch.setattr(lake_mod, "write_parquet_atomic", boom)
+        with pytest.raises(IOError):
+            c.post(f"/days/{DAY}/upload", content=CSV_A.encode(),
+                   headers={"Content-Type": "text/csv"})
+        monkeypatch.setattr(lake_mod, "write_parquet_atomic", original)
+
+        assert increment(c)["records"] == []
+        assert c.get(f"/days/{DAY}/files").json()["file_count"] == 0
+
+        upload(c, CSV_B)
+        assert [r["buoy_id"] for r in increment(c)["records"]] == ["B001", "B003"]
+
+
+def test_increment_unaffected_by_compaction_and_gc(tmp_path):
+    """Compaction + retired-file reclamation must not move or replay rows."""
+    with make_client(tmp_path, gc_interval_sec=0.1) as c:
+        upload(c, CSV_A)
+        upload(c, CSV_B)
+
+        page1 = increment(c, limit=3)
+        assert page1["row_count"] == 3 and page1["has_more"] is True
+        cursor = page1["next_cursor"]
+
+        job_id = c.post(f"/days/{DAY}/compactions").json()["job_id"]
+        assert wait_job(c, DAY, job_id)["status"] == "done"
+        c.app.state.lake.collect_garbage()  # force retired-file reclamation
+        data_dir = tmp_path / "data" / f"dt={DAY}"
+        assert len(list(data_dir.glob("*.parquet"))) == 1  # only compacted output
+
+        # the issued cursor still means exactly the same position
+        page2 = increment(c, cursor=cursor)
+        assert [r["buoy_id"] for r in page2["records"]] == ["B003"]
+        assert page2["has_more"] is False
+
+        # full re-drain: every uploaded row exactly once, no re-delivery
+        records, _ = drain_increment(c)
+        assert [r["buoy_id"] for r in records] == ["B001", "B002", "B001", "B003"]
+
+
+def test_increment_cursor_survives_restart(tmp_path):
+    with make_client(tmp_path) as c1:
+        upload(c1, CSV_A)
+        page = increment(c1, limit=1)
+        assert page["has_more"] is True
+        cursor = page["next_cursor"]
+
+    with make_client(tmp_path) as c2:  # same data dir, fresh process state
+        upload(c2, CSV_B)
+        page = increment(c2, cursor=cursor)
+        assert [r["buoy_id"] for r in page["records"]] == ["B002", "B001", "B003"]
+        assert page["has_more"] is False
+        records, _ = drain_increment(c2)
+        assert [r["buoy_id"] for r in records] == ["B001", "B002", "B001", "B003"]
+
+
+def test_increment_concurrent_uploads_stay_contiguous(tmp_path):
+    """Concurrent uploads appear as whole batches in registration order."""
+    def csv_for(i: int) -> str:
+        return (
+            "buoy_id,ts_utc,salinity\n"
+            f"T{i:02d},2026-11-18T04:{i:02d}:00Z,30.{i}\n"
+            f"T{i:02d},2026-11-18T04:{i:02d}:30Z,31.{i}\n"
+        )
+
+    with make_client(tmp_path) as c:
+        errors = []
+        def worker(i: int):
+            try:
+                upload(c, csv_for(i))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, errors
+
+        records, _ = drain_increment(c)
+        assert len(records) == 16
+        # each upload batch occupies one contiguous run of feed rows
+        runs: list[list] = []
+        for rec in records:
+            if not runs or runs[-1][0] != rec["buoy_id"]:
+                runs.append([rec["buoy_id"], 1])
+            else:
+                runs[-1][1] += 1
+        assert sorted(b for b, _ in runs) == [f"T{i:02d}" for i in range(8)]
+        assert all(n == 2 for _, n in runs)
+
+
+# schema as it existed before the incremental feed was introduced
+OLD_SCHEMA = """
+CREATE TABLE files (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    day        TEXT NOT NULL,
+    path       TEXT NOT NULL UNIQUE,
+    kind       TEXT NOT NULL CHECK (kind IN ('upload', 'compacted')),
+    state      TEXT NOT NULL CHECK (state IN ('active', 'retired')),
+    rows       INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE compactions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    day         TEXT NOT NULL,
+    status      TEXT NOT NULL CHECK (status IN ('running', 'done', 'failed')),
+    input_paths TEXT NOT NULL,
+    input_rows  INTEGER NOT NULL,
+    output_path TEXT,
+    output_rows INTEGER,
+    error       TEXT,
+    created_at  TEXT NOT NULL,
+    finished_at TEXT
+);
+"""
+
+
+def test_increment_excludes_pre_feature_data(tmp_path):
+    """Rows from before the feed existed stay in /records only (no backfill)."""
+    data_dir = tmp_path / "data"
+    day_dir = data_dir / f"dt={DAY}"
+    day_dir.mkdir(parents=True)
+    # simulate a deployment from before the incremental feed existed:
+    # old-schema DB plus one registered parquet file
+    conn = connect(str(data_dir / "lake_meta.db"))
+    conn.executescript(OLD_SCHEMA)
+    old_file = day_dir / "part-old.parquet"
+    write_parquet_atomic(parse_csv(CSV_C.encode()), old_file)
+    conn.execute(
+        "INSERT INTO files(day, path, kind, state, rows, created_at)"
+        " VALUES (?, ?, 'upload', 'active', 1, '2026-11-18T00:00:00Z')",
+        (DAY, str(old_file)),
+    )
+    conn.commit()
+    conn.close()
+
+    with make_client(tmp_path) as c:
+        # original by-day read still serves the historical row
+        body = c.get(f"/days/{DAY}/records").json()
+        assert body["row_count"] == 1
+        assert body["records"][0]["buoy_id"] == "B004"
+        # ...but the feed starts empty: only post-enablement uploads appear
+        feed = increment(c)
+        assert feed["records"] == [] and feed["has_more"] is False
+        assert feed["next_cursor"] is None
+
+        upload(c, CSV_A)
+        feed = increment(c)
+        assert [r["buoy_id"] for r in feed["records"]] == ["B001", "B002"]
+        assert feed["has_more"] is False  # historical row not backfilled
+        assert c.get(f"/days/{DAY}/records").json()["row_count"] == 3

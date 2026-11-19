@@ -4,6 +4,7 @@ Endpoints
 ---------
 POST   /days/{day}/upload                 append a CSV as one parquet file
 GET    /days/{day}/records                all records (consistent snapshot)
+GET    /days/{day}/increment              incremental feed (cursor-paged)
 GET    /days/{day}/files                  active file list / count
 POST   /days/{day}/compactions            start background compaction (202)
 GET    /days/{day}/compactions            list jobs for the day
@@ -29,6 +30,10 @@ from .lake import ConflictError, Lake, NotFoundError
 log = logging.getLogger("buoy-lake")
 
 DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+CURSOR_RE = re.compile(r"^\d{1,19}$")
+
+# Hard cap on increment-feed page size ("at most 500 rows per page").
+MAX_INCREMENT_PAGE_SIZE = 500
 
 
 def _valid_day(day: str) -> str:
@@ -91,6 +96,7 @@ def create_app(
             "endpoints": [
                 "POST /days/{day}/upload",
                 "GET /days/{day}/records",
+                "GET /days/{day}/increment",
                 "GET /days/{day}/files",
                 "POST /days/{day}/compactions",
                 "GET /days/{day}/compactions",
@@ -115,6 +121,26 @@ def create_app(
     def records(day: str, request: Request):
         """All records for the day from one consistent snapshot + file count."""
         return lake(request).read_day(_valid_day(day))
+
+    @app.get("/days/{day}/increment")
+    def increment(day: str, request: Request, cursor: str | None = None,
+                  limit: int = MAX_INCREMENT_PAGE_SIZE):
+        """Incremental feed for the day, in lake-ingestion (registration) order.
+
+        Only rows successfully uploaded after the feed feature was enabled
+        appear, each exactly as many times as it was uploaded.  ``cursor``
+        is the opaque ``next_cursor`` from a previous page (omit to start
+        at the beginning); at most 500 rows are returned per page.
+        """
+        day = _valid_day(day)
+        after = 0
+        if cursor is not None:
+            if not CURSOR_RE.match(cursor):
+                raise HTTPException(status_code=400, detail=f"invalid cursor {cursor!r}")
+            after = int(cursor)
+        if limit < 1:
+            raise HTTPException(status_code=400, detail="limit must be >= 1")
+        return lake(request).read_increment(day, after, min(limit, MAX_INCREMENT_PAGE_SIZE))
 
     @app.get("/days/{day}/files")
     def files(day: str, request: Request):

@@ -37,6 +37,7 @@ python -m pytest tests/ -q
 |---|---|---|
 | POST | `/days/{day}/upload` | 上传 CSV（multipart 文件或 `text/csv` 原始 body），追加为一个 Parquet |
 | GET | `/days/{day}/records` | 读取当日全部记录（一致快照），含 `file_count`/`row_count` |
+| GET | `/days/{day}/increment` | 增量读取：按入湖顺序分页返回启用后成功上传的记录（游标续读，每页 ≤500 行） |
 | GET | `/days/{day}/files` | 当日活跃文件清单与文件数 |
 | POST | `/days/{day}/compactions` | 启动后台压实（202）；当日已有压实进行中返回 409 |
 | GET | `/days/{day}/compactions` | 当日压实任务列表 |
@@ -61,6 +62,30 @@ curl http://localhost:8000/days/2026-11-18/records
 # 启动压实并轮询状态
 curl -X POST http://localhost:8000/days/2026-11-18/compactions
 curl http://localhost:8000/days/2026-11-18/compactions/1
+```
+
+### 增量订阅（下游按入湖顺序消费）
+
+`GET /days/{day}/increment?cursor=...&limit=...` 为下游分析程序提供按入湖
+（成功登记）顺序的增量读取，响应含 `records`（原始三列
+`buoy_id`/`ts_utc`/`salinity`）、`row_count`、`next_cursor`、`has_more`：
+
+- 只包含本功能启用后**成功上传**的行；启用前的历史观测仍通过
+  `GET /days/{day}/records` 全量读取，增量流不做回填。
+- 同一观测上传几次就交付几次（不去重）；每批上传的行在流中连续、
+  按成功登记顺序排列，并发上传之间不交错。
+- 每页最多 500 行（`limit` 默认 500，超出按 500 计）；用上一页返回的
+  `next_cursor` 作为 `cursor` 续读。翻页期间新上传的行会在后续请求中按
+  顺序出现；页面为空时 `next_cursor` 为 `null`，沿用上一次使用的游标继续
+  轮询即可。
+- 游标即全局入湖序列的高水位：压实、退役文件回收、服务重启都不会改变
+  已发游标的含义；停在一批的中间续读也不会漏行或重复。
+
+```bash
+# 从头消费当日增量（第一页）
+curl http://localhost:8000/days/2026-11-18/increment
+# 用上一页返回的 next_cursor 续读
+curl "http://localhost:8000/days/2026-11-18/increment?cursor=500&limit=500"
 ```
 
 ## 一致性与可靠性设计
@@ -88,12 +113,18 @@ curl http://localhost:8000/days/2026-11-18/compactions/1
 - **旧文件回收**：退役文件仅在在途读取引用计数归零后才 unlink；回收只针对
   登记表中 `retired` 的文件，`active` 文件（包括压实期间新追加的）永远不会
   被误删。另有后台周期清扫兜底。
+- **增量流与登记同事务**：上传的 Parquet 登记与本批 `feed_rows` 增量日志写入
+  在**同一个 SQLite 事务**中提交（transactional outbox），二者要么同时可见、
+  要么同时不可见；失败上传（CSV 解析失败、落盘失败、登记失败）绝不进入增量
+  流。`feed_rows` 只增不改、与 Parquet 文件生命周期完全解耦，增量游标
+  （`feed_rows.seq` 高水位）持久化于 SQLite，压实、旧文件回收与进程重启均不
+  改变其含义。
 
 ## 目录布局
 
 ```
 data/
-  lake_meta.db                 # SQLite 元数据（files 登记表 + compactions 任务表）
+  lake_meta.db                 # SQLite 元数据（files 登记表 + compactions 任务表 + feed_rows 增量日志）
   dt=2026-11-18/
     part-<uuid>.parquet        # 上传产生的文件
     compacted-<job>-<id>.parquet  # 压实输出

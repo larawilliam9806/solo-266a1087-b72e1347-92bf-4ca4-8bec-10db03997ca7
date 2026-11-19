@@ -5,6 +5,12 @@ Consistency model (single process, SQLite as the source of truth):
 * Upload: parquet is written to a tmp file, fsynced, atomically renamed,
   then registered ``active`` in SQLite.  A read only ever sees fully
   registered files.
+* Incremental feed: the file registration and the upload's batch of
+  ``feed_rows`` entries commit in ONE SQLite transaction (transactional
+  outbox), so a successful upload is visible in both and a failed one in
+  neither.  ``feed_rows.seq`` is assigned in successful-registration order
+  and never reused, so a feed cursor keeps its meaning across compaction,
+  retired-file reclamation and restarts.
 * Read: the active file list is snapshotted and refcounted under one lock,
   so a read always corresponds to the complete pre- or post-switch state --
   never a mix.  Retired files stay on disk until their refcount hits zero.
@@ -80,23 +86,47 @@ class Lake:
     # uploads
     # ------------------------------------------------------------------
     def upload(self, day: str, content: bytes) -> dict:
-        """Parse CSV, write one parquet file, register it. Raises CsvError."""
+        """Parse CSV, write one parquet file, register it. Raises CsvError.
+
+        The ``files`` registration and the batch's ``feed_rows`` entries
+        commit in a single transaction, so the incremental feed always
+        matches the registry: a batch appears in both or in neither.
+        """
         table = parse_csv(content)
         n = table.num_rows
         day_dir = self._day_dir(day)
         day_dir.mkdir(parents=True, exist_ok=True)
         final = day_dir / f"part-{uuid4().hex}.parquet"
         write_parquet_atomic(table, final)
+        cols = table.to_pydict()
+        feed_batch = [
+            (b, _iso_z(t), s)
+            for b, t, s in zip(cols["buoy_id"], cols["ts_utc"], cols["salinity"])
+        ]
+        conn = connect(str(self.db_path))
         try:
-            with connect(str(self.db_path)) as conn:
-                conn.execute(
-                    "INSERT INTO files(day, path, kind, state, rows, created_at)"
-                    " VALUES (?, ?, 'upload', 'active', ?, ?)",
-                    (day, str(final), n, _now_iso()),
-                )
+            # BEGIN IMMEDIATE takes the write lock up front, so concurrent
+            # uploads serialise here and feed seq numbers follow the
+            # successful-registration order.
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "INSERT INTO files(day, path, kind, state, rows, created_at)"
+                " VALUES (?, ?, 'upload', 'active', ?, ?)",
+                (day, str(final), n, _now_iso()),
+            )
+            file_id = cur.lastrowid
+            conn.executemany(
+                "INSERT INTO feed_rows(day, file_id, buoy_id, ts_utc, salinity)"
+                " VALUES (?, ?, ?, ?, ?)",
+                [(day, file_id, b, t, s) for b, t, s in feed_batch],
+            )
+            conn.commit()
         except Exception:
+            conn.rollback()
             final.unlink(missing_ok=True)  # never registered -> remove bytes
             raise
+        finally:
+            conn.close()
         log.info("uploaded %s rows to %s", n, final.name)
         return {
             "day": day,
@@ -157,6 +187,39 @@ class Lake:
                 "SELECT COUNT(*) FROM files WHERE day = ? AND state = 'active'", (day,)
             ).fetchone()
         return n
+
+    # ------------------------------------------------------------------
+    # incremental feed
+    # ------------------------------------------------------------------
+    def read_increment(self, day: str, after_seq: int = 0, limit: int = 500) -> dict:
+        """One page of the day's incremental feed, in ingestion order.
+
+        Rows come from the append-only ``feed_rows`` outbox, so the page is
+        immune to compaction, retired-file reclamation and restarts, and a
+        cursor simply means "feed rows with seq > cursor".  Newly committed
+        uploads are visible to subsequent calls immediately.
+        """
+        with connect(str(self.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT seq, buoy_id, ts_utc, salinity FROM feed_rows"
+                " WHERE day = ? AND seq > ? ORDER BY seq LIMIT ?",
+                (day, after_seq, limit + 1),  # one extra row -> has_more
+            ).fetchall()
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        records = [
+            {"buoy_id": r["buoy_id"], "ts_utc": r["ts_utc"], "salinity": r["salinity"]}
+            for r in page
+        ]
+        return {
+            "day": day,
+            "row_count": len(records),
+            "records": records,
+            # null only when the page is empty; callers then keep polling
+            # with the last cursor they used.
+            "next_cursor": str(page[-1]["seq"]) if page else None,
+            "has_more": has_more,
+        }
 
     def list_files(self, day: str) -> dict:
         with connect(str(self.db_path)) as conn:
